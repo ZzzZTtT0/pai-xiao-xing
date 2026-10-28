@@ -1,0 +1,6 @@
+.DS_Store
+*.app/
+联动组件/CodexAutoStart
+.build/
+work/
+*.log

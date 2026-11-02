@@ -107,6 +107,38 @@ final class PetPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+final class ActivityBubbleView: NSView {
+    var operation="分析任务"
+    var source="默认 Codex"
+    var tailAtTop=false
+    var tailX:CGFloat=119
+    override var isFlipped:Bool { true }
+    override var isOpaque:Bool { false }
+    func update(operation:String,source:String,layout:ActivityBubbleLayout) {
+        guard self.operation != operation || self.source != source || tailAtTop != layout.tailAtTop || tailX != layout.tailX else { return }
+        self.operation=operation;self.source=source;tailAtTop=layout.tailAtTop;tailX=layout.tailX;needsDisplay=true
+        setAccessibilityElement(true);setAccessibilityRole(.staticText);setAccessibilityLabel("\(source)：\(operation)")
+    }
+    override func draw(_ dirtyRect:NSRect) {
+        let inset:CGFloat=9
+        let body=CGRect(x:1,y:tailAtTop ? inset : 1,width:bounds.width-2,height:bounds.height-inset-1)
+        let fill=NSColor(calibratedRed:1,green:0.94,blue:0.96,alpha:0.98)
+        let stroke=NSColor(calibratedRed:0.64,green:0.40,blue:0.52,alpha:0.65)
+        let outline=NSBezierPath(roundedRect:body,xRadius:14,yRadius:14)
+        fill.setFill();outline.fill();stroke.setStroke();outline.lineWidth=1;outline.stroke()
+        let x=Geometry.clamp(tailX,14,bounds.width-14)
+        let base=tailAtTop ? body.minY+1 : body.maxY-1
+        let tip=tailAtTop ? CGFloat(0) : bounds.maxY
+        let tail=NSBezierPath();tail.move(to:CGPoint(x:x-7,y:base));tail.line(to:CGPoint(x:x,y:tip));tail.line(to:CGPoint(x:x+7,y:base));tail.close()
+        fill.setFill();tail.fill()
+        let sides=NSBezierPath();sides.move(to:CGPoint(x:x-7,y:base));sides.line(to:CGPoint(x:x,y:tip));sides.line(to:CGPoint(x:x+7,y:base));stroke.setStroke();sides.lineWidth=1;sides.stroke()
+        let style=NSMutableParagraphStyle();style.lineBreakMode = .byTruncatingTail
+        (source as NSString).draw(in:CGRect(x:15,y:body.minY+10,width:bounds.width-30,height:17),withAttributes:[.font:NSFont.systemFont(ofSize:10,weight:.medium),.foregroundColor:NSColor(calibratedRed:0.48,green:0.35,blue:0.44,alpha:1),.paragraphStyle:style])
+        (operation as NSString).draw(in:CGRect(x:15,y:body.minY+32,width:bounds.width-42,height:26),withAttributes:[.font:NSFont.systemFont(ofSize:15,weight:.semibold),.foregroundColor:NSColor(calibratedRed:0.23,green:0.17,blue:0.25,alpha:1),.paragraphStyle:style])
+        NSColor(calibratedRed:0.41,green:0.68,blue:0.57,alpha:1).setFill();NSBezierPath(ovalIn:CGRect(x:bounds.width-24,y:body.minY+39,width:6,height:6)).fill()
+    }
+}
+
 final class StatsView: NSView {
     var snapshot: UsageSnapshot?
     var session: SessionInfo?

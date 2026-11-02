@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 enum DockEdge: String, Codable, CaseIterable {
     case left, right, top, bottom
@@ -21,12 +22,36 @@ enum Geometry {
         switch edge { case .left: p.x=area.minX; case .right: p.x=area.maxX-size.width; case .top: p.y=area.maxY-size.height; case .bottom: p.y=area.minY }
         return p
     }
-    static func tooltip(pet: CGRect, size: CGSize, area: CGRect) -> CGPoint {
+    static func tooltip(pet: CGRect, size: CGSize, area: CGRect,avoiding:CGRect?=nil) -> CGPoint {
         var x = pet.maxX+12
         if x+size.width > area.maxX { x = pet.minX-size.width-12 }
         let y = pet.midY-size.height/2
-        return constrained(CGPoint(x:x,y:y), size:size, area:area)
+        let base=constrained(CGPoint(x:x,y:y),size:size,area:area)
+        guard let obstacle=avoiding,CGRect(origin:base,size:size).intersects(obstacle) else { return base }
+        let candidates=[CGPoint(x:obstacle.maxX+10,y:base.y),CGPoint(x:obstacle.minX-size.width-10,y:base.y),CGPoint(x:base.x,y:obstacle.minY-size.height-10),CGPoint(x:base.x,y:obstacle.maxY+10)]
+        return candidates.map { constrained($0,size:size,area:area) }
+            .filter { area.contains(CGRect(origin:$0,size:size)) && !CGRect(origin:$0,size:size).intersects(obstacle) }
+            .min { hypot($0.x-base.x,$0.y-base.y)<hypot($1.x-base.x,$1.y-base.y) } ?? base
     }
+    static func activityBubble(pet:CGRect,size:CGSize,area:CGRect,edge:DockEdge?) -> ActivityBubbleLayout {
+        var anchor=CGPoint(x:pet.midX,y:pet.maxY-8)
+        if edge == .left { anchor.x=pet.minX+pet.width*0.28 }
+        if edge == .right { anchor.x=pet.maxX-pet.width*0.28 }
+        if edge == .bottom { anchor.y=pet.minY+pet.height*0.54 }
+        if edge == .top { anchor.y=pet.maxY-pet.height*0.54 }
+        var y=anchor.y+8
+        if edge == .top { y=anchor.y-size.height-8 }
+        else if y+size.height>area.maxY { y=pet.minY-size.height-8 }
+        let origin=constrained(CGPoint(x:anchor.x-size.width/2,y:y),size:size,area:area)
+        let frame=CGRect(origin:origin,size:size)
+        return ActivityBubbleLayout(frame:frame,tailAtTop:frame.midY<anchor.y,tailX:clamp(anchor.x-origin.x,14,size.width-14))
+    }
+}
+
+struct ActivityBubbleLayout {
+    let frame:CGRect
+    let tailAtTop:Bool
+    let tailX:CGFloat
 }
 
 struct LimitWindow {
@@ -123,20 +148,89 @@ struct SessionInfo: Equatable {
     let path: URL
     let folder: String
     let modified: Date
-    var label: String { "\(folder.isEmpty ? "会话" : folder) · \(id.prefix(8))" }
+    var sourceName: String = "默认 Codex"
+    var sourceKey:String = ""
+    var selectionKey: String { path.standardizedFileURL.resolvingSymlinksInPath().path }
+    var label: String { "\(sourceName) · \(folder.isEmpty ? "会话" : folder) · \(id.prefix(8))" }
+}
+
+struct SessionSource {
+    let home: URL
+    let label: String
+}
+
+struct SessionReading {
+    let usage:UsageSnapshot?
+    let activity:TaskActivity
+    let error:String?
+}
+
+struct SessionBinding {
+    var id:String?
+    var path:String?
+    mutating func resolve(in sessions:[SessionInfo],following:Bool,legacyHome:URL) -> SessionInfo? {
+        if following { return sessions.first }
+        if let path=path { return sessions.first(where:{$0.selectionKey==path}) }
+        let root=legacyHome.standardizedFileURL.resolvingSymlinksInPath().path
+        guard let chosen=sessions.first(where:{$0.id==id && $0.sourceKey==root}) else { return nil }
+        path=chosen.selectionKey
+        return chosen
+    }
+}
+
+private final class SessionCursor {
+    var offset:UInt64=0
+    var pending=Data()
+    var usage:UsageSnapshot?
+    var activity=TaskActivity()
+    var fileIdentity:String?
+    var boundary=Data()
+    func reset() { offset=0;pending=Data();usage=nil;activity=TaskActivity();fileIdentity=nil;boundary=Data() }
 }
 
 final class SessionReader {
     let home: URL
-    private var cachedPath: URL?
-    private var offset: UInt64=0
-    private var pending=Data()
-    private var cached: UsageSnapshot?
-    init(home: URL) { self.home=home }
+    let cockpitRoot: URL
+    let additionalHomes: [URL]
+    private var cursors:[String:SessionCursor]=[:]
+    private var recentPaths:[String]=[]
+    init(home: URL,cockpitRoot:URL?=nil,additionalHomes:[URL]=[]) {
+        self.home=home
+        self.cockpitRoot=cockpitRoot ?? home.deletingLastPathComponent().appendingPathComponent(".cockpit_tools/instances/codex")
+        self.additionalHomes=additionalHomes
+    }
 
-    func sessions(preferredID: String?) -> [SessionInfo] {
-        let folder=home.appendingPathComponent("sessions",isDirectory:true)
-        guard let iterator=FileManager.default.enumerator(at:folder,includingPropertiesForKeys:[.contentModificationDateKey,.isRegularFileKey],options:[.skipsHiddenFiles]) else { return [] }
+    func sources() -> [SessionSource] {
+        var found:[SessionSource]=[]
+        func add(_ root:URL,_ label:String) {
+            let canonical=root.standardizedFileURL.resolvingSymlinksInPath()
+            if let index=found.firstIndex(where:{$0.home==canonical}) {
+                if label.hasPrefix("Cockpit") { found[index]=SessionSource(home:canonical,label:label) }
+            } else { found.append(SessionSource(home:canonical,label:label)) }
+        }
+        let canonicalHome=home.standardizedFileURL.resolvingSymlinksInPath()
+        let homeIsDefault=additionalHomes.isEmpty || additionalHomes.contains { $0.standardizedFileURL.resolvingSymlinksInPath()==canonicalHome }
+        let customName=home.lastPathComponent==".codex" ? home.deletingLastPathComponent().lastPathComponent : home.lastPathComponent
+        add(home,homeIsDefault ? "默认 Codex" : "自定义 Codex · \(customName)")
+        for root in additionalHomes { add(root,"默认 Codex") }
+        let instances=(try? FileManager.default.contentsOfDirectory(at:cockpitRoot,includingPropertiesForKeys:nil,options:[.skipsHiddenFiles])) ?? []
+        for instance in instances.sorted(by:{$0.lastPathComponent < $1.lastPathComponent}) {
+            for root in [instance,instance.appendingPathComponent(".codex")] {
+                var directory:ObjCBool=false
+                if FileManager.default.fileExists(atPath:root.appendingPathComponent("sessions").path,isDirectory:&directory),directory.boolValue {
+                    add(root,"Cockpit \(instance.lastPathComponent)"+(root==instance ? "" : " / .codex"))
+                }
+            }
+        }
+        return found
+    }
+
+    func sessions(preferredID: String?,preferredPath:String?=nil) -> [SessionInfo] {
+        var found:[SessionInfo]=[]
+        var visited=Set<String>()
+        for source in sources() {
+        let folder=source.home.appendingPathComponent("sessions",isDirectory:true)
+        guard let iterator=FileManager.default.enumerator(at:folder,includingPropertiesForKeys:[.contentModificationDateKey,.isRegularFileKey],options:[.skipsHiddenFiles]) else { continue }
         var files: [(URL,Date)]=[]
         for case let url as URL in iterator where url.pathExtension=="jsonl" {
             guard let rv=try? url.resourceValues(forKeys:[.contentModificationDateKey,.isRegularFileKey]),rv.isRegularFile==true else { continue }
@@ -145,7 +239,7 @@ final class SessionReader {
         files.sort { $0.1 > $1.1 }
         var candidates=Array(files.prefix(128))
         if let id=preferredID, !candidates.contains(where:{$0.0.lastPathComponent.contains(id)}), let pinned=files.first(where:{$0.0.lastPathComponent.contains(id)}) { candidates.append(pinned) }
-        var found: [SessionInfo]=[]
+        if let path=preferredPath, !candidates.contains(where:{$0.0.standardizedFileURL.resolvingSymlinksInPath().path==path}),let pinned=files.first(where:{$0.0.standardizedFileURL.resolvingSymlinksInPath().path==path}) { candidates.append(pinned) }
         for (url,modified) in candidates {
             guard let h=try? FileHandle(forReadingFrom:url) else { continue }
             let data=(try? h.read(upToCount:32_768)) ?? Data(); try? h.close()
@@ -154,38 +248,68 @@ final class SessionReader {
                   let p=o["payload"] as? [String:Any],let id=p["id"] as? String else { continue }
             if let source=p["source"] as? [String:Any],source["subagent"] != nil { continue }
             let cwd=(p["cwd"] as? String).map { URL(fileURLWithPath:$0).lastPathComponent } ?? "会话"
-            found.append(SessionInfo(id:id,path:url,folder:cwd,modified:modified))
+            var session=SessionInfo(id:id,path:url,folder:cwd,modified:modified)
+            session.sourceName=source.label
+            session.sourceKey=source.home.path
+            if visited.insert(session.selectionKey).inserted { found.append(session) }
         }
-        return found.sorted { $0.modified > $1.modified }
+        }
+        return found.sorted { $0.modified == $1.modified ? $0.selectionKey < $1.selectionKey : $0.modified > $1.modified }
     }
 
     func read(_ session: SessionInfo) -> (UsageSnapshot?,String?) {
-        guard let handle=try? FileHandle(forReadingFrom:session.path) else { return (nil,"无法读取会话日志，请检查目录权限") }
+        let state=readState(session)
+        return (state.usage,state.error)
+    }
+    func readState(_ session:SessionInfo) -> SessionReading {
+        let key=session.selectionKey
+        guard let handle=try? FileHandle(forReadingFrom:session.path) else {
+            cursors.removeValue(forKey:key)
+            return SessionReading(usage:nil,activity:TaskActivity(),error:"无法读取会话日志，请检查目录权限")
+        }
         defer { try? handle.close() }
+        let cursor=cursors[key] ?? SessionCursor()
+        cursors[key]=cursor;recentPaths.removeAll { $0==key };recentPaths.append(key)
+        while recentPaths.count>8 { cursors.removeValue(forKey:recentPaths.removeFirst()) }
         do {
             let length=try handle.seekToEnd()
-            if cachedPath != session.path || length<offset {
-                cachedPath=session.path; cached=nil; pending=Data()
+            var statInfo=stat()
+            let identity=fstat(handle.fileDescriptor,&statInfo)==0 ? "\(statInfo.st_dev):\(statInfo.st_ino)" : nil
+            var replaced=length<cursor.offset || (cursor.fileIdentity != nil && identity != cursor.fileIdentity)
+            if !replaced,cursor.offset>0,!cursor.boundary.isEmpty {
+                try handle.seek(toOffset:cursor.offset-UInt64(cursor.boundary.count))
+                let boundary=try handle.read(upToCount:cursor.boundary.count) ?? Data()
+                replaced=boundary != cursor.boundary
+            }
+            if cursor.offset==0 || replaced {
+                cursor.reset()
                 // A bounded initial tail, then only read newly appended bytes.
-                offset=length > 16_777_216 ? length-16_777_216 : 0
-                if offset>0 {
-                    try handle.seek(toOffset:offset)
+                cursor.offset=length > 16_777_216 ? length-16_777_216 : 0
+                if cursor.offset>0 {
+                    try handle.seek(toOffset:cursor.offset)
                     let start=try handle.read(upToCount:262_144) ?? Data()
-                    if let newline=start.firstIndex(of:10) { offset+=UInt64(newline+1) }
+                    if let newline=start.firstIndex(of:10) { cursor.offset+=UInt64(newline+1) }
                 }
             }
-            try handle.seek(toOffset:offset)
+            cursor.fileIdentity=identity
+            try handle.seek(toOffset:cursor.offset)
             let data=try handle.read(upToCount:33_554_432) ?? Data()
-            offset+=UInt64(data.count)
-            pending.append(data)
-            if let newline=pending.lastIndex(of:10) {
-                let complete=pending.prefix(through:newline)
-                cached=LogParser.consume(Data(complete),previous:cached)
-                pending=Data(pending.suffix(from:pending.index(after:newline)))
+            cursor.offset+=UInt64(data.count)
+            cursor.pending.append(data)
+            if let newline=cursor.pending.lastIndex(of:10) {
+                let complete=Data(cursor.pending.prefix(through:newline))
+                cursor.usage=LogParser.consume(complete,previous:cursor.usage)
+                cursor.activity=ActivityParser.consume(complete,previous:cursor.activity)
+                cursor.pending=Data(cursor.pending.suffix(from:cursor.pending.index(after:newline)))
             }
-            if pending.count>8_388_608 { pending=Data() }
-            return (cached,cached==nil ? "本会话尚无用量记录，完成一轮对话后会更新" : nil)
-        } catch { return (cached,"会话日志读取失败：\(error.localizedDescription)") }
+            if cursor.pending.count>8_388_608 { cursor.pending=Data() }
+            let markerLength=Int(min(128,cursor.offset))
+            if markerLength>0 {
+                try handle.seek(toOffset:cursor.offset-UInt64(markerLength))
+                cursor.boundary=try handle.read(upToCount:markerLength) ?? Data()
+            }
+            return SessionReading(usage:cursor.usage,activity:cursor.activity,error:cursor.usage==nil ? "本会话尚无用量记录，完成一轮对话后会更新" : nil)
+        } catch { return SessionReading(usage:cursor.usage,activity:TaskActivity(),error:"会话日志读取失败：\(error.localizedDescription)") }
     }
 }
 

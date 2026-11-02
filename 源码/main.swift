@@ -4,8 +4,39 @@ func renderBitmap(size:CGSize,draw:()->Void) -> NSBitmapImageRep {
     let rep=NSBitmapImageRep(bitmapDataPlanes:nil,pixelsWide:Int(size.width),pixelsHigh:Int(size.height),bitsPerSample:8,samplesPerPixel:4,hasAlpha:true,isPlanar:false,colorSpaceName:.deviceRGB,bytesPerRow:0,bitsPerPixel:0)!
     NSGraphicsContext.saveGraphicsState()
     NSGraphicsContext.current=NSGraphicsContext(bitmapImageRep:rep)
+    NSGraphicsContext.current?.cgContext.clear(CGRect(origin:.zero,size:size))
     draw();NSGraphicsContext.restoreGraphicsState()
     return rep
+}
+
+func renderActivityPreview(_ artwork:PetArtwork,to folder:URL) throws {
+    try FileManager.default.createDirectory(at:folder,withIntermediateDirectories:true)
+    var session=SessionInfo(id:"example-session",path:URL(fileURLWithPath:"/fixture/session.jsonl"),folder:"示例项目",modified:Date())
+    session.sourceName="Cockpit 示例"
+    let card=StatsView(frame:CGRect(x:0,y:0,width:344,height:342))
+    card.update(snapshot:UsageSnapshot(inputTokens:120_000,outputTokens:2000,capacity:475_000,usageDate:Date(),primary:LimitWindow(usedPercent:25,minutes:300,resetsAt:Date().addingTimeInterval(3600)),secondary:LimitWindow(usedPercent:40,minutes:10080,resetsAt:Date().addingTimeInterval(86400)),quotaDate:Date()),session:session,message:nil,following:true)
+    let bubble=ActivityBubbleView(frame:CGRect(x:0,y:0,width:238,height:84))
+    let layout=ActivityBubbleLayout(frame:bubble.frame,tailAtTop:false,tailX:119)
+    bubble.update(operation:"运行测试",source:session.sourceName,layout:layout)
+    func cached(_ view:NSView) -> NSImage? {
+        guard let rep=view.bitmapImageRepForCachingDisplay(in:view.bounds) else { return nil }
+        view.cacheDisplay(in:view.bounds,to:rep)
+        guard let image=rep.cgImage else { return nil }
+        return NSImage(cgImage:image,size:view.bounds.size)
+    }
+    let rep=renderBitmap(size:CGSize(width:1000,height:600)) {
+        NSColor(calibratedRed:0.94,green:0.95,blue:0.97,alpha:1).setFill();NSBezierPath(rect:CGRect(x:0,y:0,width:1000,height:600)).fill()
+        ("派小星 v1.1" as NSString).draw(at:CGPoint(x:40,y:540),withAttributes:[.font:NSFont.systemFont(ofSize:30,weight:.semibold),.foregroundColor:NSColor(calibratedRed:0.24,green:0.18,blue:0.27,alpha:1)])
+        ("Cockpit 多实例会话 · 任务操作气泡" as NSString).draw(at:CGPoint(x:42,y:506),withAttributes:[.font:NSFont.systemFont(ofSize:17),.foregroundColor:NSColor.darkGray])
+        artwork.render(in:CGRect(x:126,y:96,width:192,height:208),edge:nil,mood:.work,phase:0.28,reduced:false)
+        cached(bubble)?.draw(in:CGRect(x:103,y:310,width:238,height:84))
+        cached(card)?.draw(in:CGRect(x:584,y:108,width:344,height:342))
+        ("执行任务时，显示当前关键操作\n完成或取消后，气泡自动收起" as NSString).draw(in:CGRect(x:66,y:31,width:400,height:54),withAttributes:[.font:NSFont.systemFont(ofSize:15),.foregroundColor:NSColor.darkGray])
+        ("用量和气泡跟随同一个会话\n右键可切换实例、锁定会话或关闭气泡" as NSString).draw(in:CGRect(x:553,y:31,width:410,height:54),withAttributes:[.font:NSFont.systemFont(ofSize:15),.foregroundColor:NSColor.darkGray])
+        ("界面示例，非真实会话数据" as NSString).draw(at:CGPoint(x:695,y:471),withAttributes:[.font:NSFont.systemFont(ofSize:12),.foregroundColor:NSColor.gray])
+    }
+    try rep.representation(using:.png,properties:[:])!.write(to:folder.appendingPathComponent("activity-preview.png"))
+    print("Rendered synthetic activity bubble and Cockpit usage preview")
 }
 func renderPreviews(_ artwork:PetArtwork,to folder:URL) throws {
     try FileManager.default.createDirectory(at:folder,withIntermediateDirectories:true)
@@ -77,6 +108,18 @@ func renderingTests(_ artwork:PetArtwork) throws {
 let args=CommandLine.arguments
 do {
     if args.contains("--self-test") { try runTests();exit(0) }
+    if args.contains("--inspect-sources") {
+        let userHome=FileManager.default.homeDirectoryForCurrentUser
+        let home=URL(fileURLWithPath:ProcessInfo.processInfo.environment["CODEX_HOME"] ?? userHome.appendingPathComponent(".codex").path)
+        let reader=SessionReader(home:home,cockpitRoot:userHome.appendingPathComponent(".cockpit_tools/instances/codex"),additionalHomes:[userHome.appendingPathComponent(".codex")])
+        let sessions=reader.sessions(preferredID:nil)
+        let rows=reader.sources().map { source -> [String:Any] in
+            let matches=sessions.filter { $0.selectionKey.hasPrefix(source.home.path+"/") }
+            let state=matches.first.map { reader.readState($0) }
+            return ["source":source.label,"discoveredSessions":matches.count,"latestHasUsage":state?.usage != nil,"latestTaskActive":state?.activity.bubbleText() != nil]
+        }
+        let data=try JSONSerialization.data(withJSONObject:rows,options:[.sortedKeys]);print(String(data:data,encoding:.utf8)!);exit(0)
+    }
     if let index=args.firstIndex(of:"--inspect-log"),args.count>index+1 {
         let path=URL(fileURLWithPath:args[index+1]),reader=SessionReader(home:path.deletingLastPathComponent())
         let session=SessionInfo(id:"inspection",path:path,folder:"",modified:Date())
@@ -91,6 +134,7 @@ do {
     let artwork=try PetArtwork(resourceURL:resources)
     if args.contains("--render-tests") { try renderingTests(artwork);exit(0) }
     if let index=args.firstIndex(of:"--render-previews"),args.count>index+1 { try renderPreviews(artwork,to:URL(fileURLWithPath:args[index+1]));exit(0) }
+    if let index=args.firstIndex(of:"--render-activity-preview"),args.count>index+1 { try renderActivityPreview(artwork,to:URL(fileURLWithPath:args[index+1]));exit(0) }
     let smoke=args.contains("--smoke-test")
     if !smoke,let bundleID=Bundle.main.bundleIdentifier,
        NSRunningApplication.runningApplications(withBundleIdentifier:bundleID).contains(where:{$0.processIdentifier != ProcessInfo.processInfo.processIdentifier}) {

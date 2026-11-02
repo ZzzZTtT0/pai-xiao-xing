@@ -10,6 +10,10 @@ final class PetController: NSObject, NSApplicationDelegate {
     var petView: PetView!
     var tooltip: PetPanel!
     var statsView: StatsView!
+    var bubblePanel:PetPanel!
+    var bubbleView:ActivityBubbleView!
+    var activity=TaskActivity()
+    var bubblesEnabled=true
     var statusItem: NSStatusItem!
     var timer: Timer?
     var dataTimer: Timer?
@@ -18,6 +22,7 @@ final class PetController: NSObject, NSApplicationDelegate {
     var snapshot: UsageSnapshot?
     var dataMessage: String?
     var preferredID: String?
+    var preferredPath:String?
     var following=false
     var fetching=false
     var selectionGeneration=0
@@ -43,11 +48,14 @@ final class PetController: NSObject, NSApplicationDelegate {
         self.defaults=preferences
         let env=ProcessInfo.processInfo.environment
         let home=URL(fileURLWithPath:env["CODEX_HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path,isDirectory:true)
-        reader=SessionReader(home:home)
+        let userHome=FileManager.default.homeDirectoryForCurrentUser
+        reader=SessionReader(home:home,cockpitRoot:userHome.appendingPathComponent(".cockpit_tools/instances/codex"),additionalHomes:[userHome.appendingPathComponent(".codex")])
         super.init()
         let config=(try? Data(contentsOf:resourceURL.appendingPathComponent("Defaults.json"))).flatMap { (try? JSONSerialization.jsonObject(with:$0)) as? [String:Any] }
         preferredID=(defaults.string(forKey:"sessionID") ?? config?["preferredSessionID"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        preferredPath=defaults.string(forKey:"sessionPath")
         following=defaults.object(forKey:"followRecentSession") as? Bool ?? (preferredID == nil)
+        bubblesEnabled=defaults.object(forKey:"showTaskBubble") as? Bool ?? true
         snapEnabled=defaults.object(forKey:"snapEnabled") as? Bool ?? true
         interactionScale=CGFloat(defaults.double(forKey:"petWidth"));if interactionScale<120 || interactionScale>300 { interactionScale=192 }
     }
@@ -77,6 +85,10 @@ final class PetController: NSObject, NSApplicationDelegate {
         tooltip=PetPanel(contentRect:statsView.frame,styleMask:[.borderless,.nonactivatingPanel],backing:.buffered,defer:false)
         configure(tooltip);tooltip.hasShadow=true;tooltip.ignoresMouseEvents=true;tooltip.contentView=statsView
         tooltip.title="派小星会话状态"
+        bubbleView=ActivityBubbleView(frame:CGRect(x:0,y:0,width:238,height:84))
+        bubblePanel=PetPanel(contentRect:bubbleView.frame,styleMask:[.borderless,.nonactivatingPanel],backing:.buffered,defer:false)
+        configure(bubblePanel);bubblePanel.hasShadow=true;bubblePanel.ignoresMouseEvents=true;bubblePanel.contentView=bubbleView
+        bubblePanel.title="派小星任务气泡"
         statusItem=NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength)
         statusItem.button?.image=NSImage(systemSymbolName:"star.fill",accessibilityDescription:"派小星")
         statusItem.button?.toolTip="派小星：拖动贴边，悬停查看用量"
@@ -85,7 +97,7 @@ final class PetController: NSObject, NSApplicationDelegate {
         DistributedNotificationCenter.default().addObserver(self,selector:#selector(showAgain),name:Self.showNotification,object:nil)
         window.orderFrontRegardless()
         timer=Timer.scheduledTimer(withTimeInterval:0.08,repeats:true) { [weak self] _ in self?.tick() }
-        dataTimer=Timer.scheduledTimer(withTimeInterval:4,repeats:true) { [weak self] _ in self?.refreshData() }
+        dataTimer=Timer.scheduledTimer(withTimeInterval:1,repeats:true) { [weak self] _ in self?.refreshData() }
         refreshData(force:true)
         if smokeMode { DispatchQueue.main.asyncAfter(deadline:.now()+0.5) { self.runWindowSmokeTest() } }
     }
@@ -131,7 +143,7 @@ final class PetController: NSObject, NSApplicationDelegate {
     func beginDrag(_ event:NSEvent) {
         if event.clickCount>=2 { perform(.jump);return }
         dragging=true;moved=false;dragMouse=NSEvent.mouseLocation;dragOrigin=window.frame.origin
-        tooltip.orderOut(nil);hoverStarted=nil;NSCursor.closedHand.set()
+        tooltip.orderOut(nil);bubblePanel.orderOut(nil);hoverStarted=nil;NSCursor.closedHand.set()
     }
     func drag(_ event:NSEvent) {
         guard dragging else { return }
@@ -168,11 +180,15 @@ final class PetController: NSObject, NSApplicationDelegate {
         if !dragging && actionUntil != .distantPast && now>=actionUntil {
             petView.mood = .idle;actionUntil = .distantPast;lastIdleChange=now
         }
-        if !dragging && actionUntil<now && now.timeIntervalSince(lastIdleChange)>14 {
+        let working=activity.bubbleText(at:now) != nil
+        if !dragging && actionUntil<now && working { petView.mood=activity.operation=="分析任务" ? .think : .work }
+        else if !dragging && actionUntil<now && petView.mood == .work { petView.mood = .idle;lastIdleChange=now }
+        if !dragging && !working && actionUntil<now && now.timeIntervalSince(lastIdleChange)>14 {
             petView.mood=reduced ? .idle : [.idle,.idle,.sleepy,.think].randomElement()!
             lastIdleChange=now
         }
         if window.isVisible && !manuallyHidden { petView.needsDisplay=true }
+        updateBubble(at:now)
         let mouse=NSEvent.mouseLocation
         let local=CGPoint(x:mouse.x-window.frame.minX,y:mouse.y-window.frame.minY)
         let overPet=window.isVisible && !manuallyHidden && petView.containsPet(local)
@@ -183,7 +199,7 @@ final class PetController: NSObject, NSApplicationDelegate {
             if hoverStarted==nil { hoverStarted=now }
             if now.timeIntervalSince(hoverStarted!)>=0.55 {
                 let s=dockedScreen ?? screen(at:mouse)
-                let target=Geometry.tooltip(pet:window.frame,size:tooltip.frame.size,area:s.visibleFrame)
+                let target=Geometry.tooltip(pet:window.frame,size:tooltip.frame.size,area:s.visibleFrame,avoiding:bubblePanel.isVisible ? bubblePanel.frame : nil)
                 tooltip.setFrameOrigin(target);tooltip.orderFrontRegardless()
             }
         } else {
@@ -193,22 +209,39 @@ final class PetController: NSObject, NSApplicationDelegate {
         }
     }
 
+    func updateBubble(at now:Date=Date()) {
+        guard bubblesEnabled,!dragging,!manuallyHidden,window.isVisible,let operation=activity.bubbleText(at:now),let session=currentSession else {
+            bubblePanel.orderOut(nil);return
+        }
+        let screen=dockedScreen ?? self.screen(at:CGPoint(x:window.frame.midX,y:window.frame.midY))
+        let layout=Geometry.activityBubble(pet:window.frame,size:bubblePanel.frame.size,area:screen.visibleFrame,edge:petView.edge)
+        bubbleView.update(operation:operation,source:session.sourceName,layout:layout)
+        if bubblePanel.frame != layout.frame { bubblePanel.setFrame(layout.frame,display:true) }
+        if !bubblePanel.isVisible { bubblePanel.orderFrontRegardless() }
+    }
+
     func refreshData(force:Bool=false) {
         guard !fetching else { return };fetching=true
-        let generation=selectionGeneration,id=preferredID,auto=following
-        let discover=force || Date().timeIntervalSince(lastDiscovery)>16
+        let generation=selectionGeneration,id=preferredID,path=preferredPath,auto=following
+        let discover=force || Date().timeIntervalSince(lastDiscovery)>4
         let candidates=sessionList
         queue.async { [weak self] in
             guard let self=self else { return }
-            let sessions=discover ? self.reader.sessions(preferredID:id) : candidates
-            let chosen=auto ? sessions.first : sessions.first(where:{$0.id==id})
-            let result=chosen.map { self.reader.read($0) } ?? (nil,auto ? "没有找到本地 Codex 主会话" : "没有找到绑定会话，右键派小星重新选择")
+            let sessions=discover ? self.reader.sessions(preferredID:id,preferredPath:path) : candidates
+            var binding=SessionBinding(id:id,path:path)
+            let chosen=binding.resolve(in:sessions,following:auto,legacyHome:self.reader.home)
+            let resolvedPath=binding.path
+            let result=chosen.map { self.reader.readState($0) } ?? SessionReading(usage:nil,activity:TaskActivity(),error:auto ? "没有找到本地 Codex 主会话" : "没有找到绑定会话，右键派小星重新选择")
             DispatchQueue.main.async {
                 self.fetching=false
                 guard self.selectionGeneration==generation else { self.refreshData(force:true);return }
-                self.sessionList=sessions;self.currentSession=chosen;self.snapshot=result.0;self.dataMessage=result.1
+                if !auto,self.preferredPath==nil,let resolvedPath=resolvedPath {
+                    self.preferredPath=resolvedPath;self.defaults.set(resolvedPath,forKey:"sessionPath")
+                }
+                self.sessionList=sessions;self.currentSession=chosen;self.snapshot=result.usage;self.dataMessage=result.error;self.activity=result.activity
                 if discover { self.lastDiscovery=Date() }
-                self.statsView.update(snapshot:result.0,session:chosen,message:result.1,following:auto)
+                self.statsView.update(snapshot:result.usage,session:chosen,message:result.error,following:auto)
+                self.updateBubble()
             }
         }
     }
@@ -239,12 +272,26 @@ final class PetController: NSObject, NSApplicationDelegate {
         for (name,w) in [("小巧",144),("标准",192),("大一点",240)] { sizes.addItem(item(name,#selector(selectSize(_:)),represented:w,checked:Int(interactionScale)==w)) }
         let sizeItem=NSMenuItem(title:"大小",action:nil,keyEquivalent:"");sizeItem.submenu=sizes;menu.addItem(sizeItem)
         menu.addItem(item("减少动画",#selector(toggleQuiet),checked:defaults.bool(forKey:"quietAnimations")))
+        menu.addItem(item("显示任务气泡",#selector(toggleBubbles),checked:bubblesEnabled))
         menu.addItem(.separator())
         let data=NSMenu(title:"会话数据")
         data.addItem(item("跟随最近活跃会话",#selector(followRecent),checked:following))
-        if let current=currentSession { data.addItem(item("锁定当前数据会话",#selector(selectSession(_:)),represented:current.id,checked:!following && preferredID==current.id)) }
+        if let current=currentSession { data.addItem(item("锁定当前数据会话",#selector(selectSession(_:)),represented:current.selectionKey,checked:!following)) }
         data.addItem(.separator())
-        for session in sessionList.prefix(12) { data.addItem(item(session.label,#selector(selectSession(_:)),represented:session.id,checked:!following && preferredID==session.id)) }
+        let sourceGroups=Dictionary(grouping:sessionList,by:\.sourceKey)
+        let sourceKeys=Array(sourceGroups.keys).sorted { lhs,rhs in
+            let left=sourceGroups[lhs]?.first?.sourceName ?? "",right=sourceGroups[rhs]?.first?.sourceName ?? ""
+            if (left=="默认 Codex") != (right=="默认 Codex") { return left=="默认 Codex" }
+            return left==right ? lhs<rhs : left<right
+        }
+        for key in sourceKeys {
+            guard let sessions=sourceGroups[key],let name=sessions.first?.sourceName else { continue }
+            let heading=NSMenuItem(title:name,action:nil,keyEquivalent:"");heading.isEnabled=false;data.addItem(heading)
+            for session in sessions.prefix(8) {
+                let selected=preferredPath.map { $0==session.selectionKey } ?? (currentSession?.selectionKey==session.selectionKey)
+                data.addItem(item("\(session.folder) · \(session.id.prefix(8))",#selector(selectSession(_:)),represented:session.selectionKey,checked:!following && selected))
+            }
+        }
         let dataItem=NSMenuItem(title:"会话数据",action:nil,keyEquivalent:"");dataItem.submenu=data;menu.addItem(dataItem)
         menu.addItem(item("立即刷新用量",#selector(forceRefresh)))
         menu.addItem(item("使用与数据说明",#selector(showHelp)))
@@ -264,18 +311,20 @@ final class PetController: NSObject, NSApplicationDelegate {
         updatePosition(window.frame.origin,edge:petView.edge,screen:dockedScreen ?? NSScreen.main!,animate:false)
     }
     @objc func selectSession(_ sender:NSMenuItem) {
-        guard let id=sender.representedObject as? String else { return }
-        preferredID=id;following=false;defaults.set(id,forKey:"sessionID");defaults.set(false,forKey:"followRecentSession")
+        guard let key=sender.representedObject as? String,let session=sessionList.first(where:{$0.selectionKey==key}) else { return }
+        preferredID=session.id;preferredPath=key;following=false;defaults.set(session.id,forKey:"sessionID");defaults.set(key,forKey:"sessionPath");defaults.set(false,forKey:"followRecentSession")
+        activity=TaskActivity();bubblePanel.orderOut(nil)
         selectionGeneration+=1;snapshot=nil;statsView.update(snapshot:nil,session:nil,message:"正在读取所选会话…",following:false);refreshData(force:true)
     }
-    @objc func followRecent() { following=true;defaults.set(true,forKey:"followRecentSession");selectionGeneration+=1;refreshData(force:true) }
+    @objc func followRecent() { following=true;activity=TaskActivity();bubblePanel.orderOut(nil);defaults.set(true,forKey:"followRecentSession");selectionGeneration+=1;refreshData(force:true) }
     @objc func forceRefresh() { refreshData(force:true) }
     @objc func toggleSnap() {
         snapEnabled.toggle();defaults.set(snapEnabled,forKey:"snapEnabled")
         if !snapEnabled { updatePosition(window.frame.origin,edge:nil,screen:dockedScreen ?? NSScreen.main!,animate:false) }
     }
     @objc func toggleQuiet() { defaults.set(!defaults.bool(forKey:"quietAnimations"),forKey:"quietAnimations");petView.mood = .idle }
-    @objc func toggleHidden() { manuallyHidden.toggle();if manuallyHidden { window.orderOut(nil);tooltip.orderOut(nil) } else { window.orderFrontRegardless() } }
+    @objc func toggleBubbles() { bubblesEnabled.toggle();defaults.set(bubblesEnabled,forKey:"showTaskBubble");updateBubble() }
+    @objc func toggleHidden() { manuallyHidden.toggle();if manuallyHidden { window.orderOut(nil);tooltip.orderOut(nil);bubblePanel.orderOut(nil) } else { window.orderFrontRegardless() } }
     @objc func showAgain() { manuallyHidden=false;window.orderFrontRegardless() }
     @objc func centerPet() {
         manuallyHidden=false
@@ -288,10 +337,11 @@ final class PetController: NSObject, NSApplicationDelegate {
         let chosen=screen(at:CGPoint(x:window.frame.midX,y:window.frame.midY))
         updatePosition(window.frame.origin,edge:petView.edge,screen:chosen,animate:false)
         tooltip.orderOut(nil)
+        bubblePanel.orderOut(nil)
     }
     @objc func showHelp() {
         let alert=NSAlert();alert.messageText="派小星陪你工作"
-        alert.informativeText="拖动：自由摆放；靠近屏幕可用边缘 36 点以内松手，自动吸附并变换姿势。\n双击：跳一下。右键：动作、大小、会话与退出。\n\n悬停约半秒显示上下文用量和账号额度。首次使用默认跟随最近活跃主会话，也可选择并锁定一个会话；不检测当前前台聊天页签。\n\n上下文取最近一轮输入与输出 token 总和，不是逐轮累计消耗。额度是日志快照，账号共享，并标明更新时间；到达重置时间后等待新快照。\n\n程序只在本机读取 Codex 会话元数据和用量事件，不联网、不读取登录凭据。随 Codex 启动联动由配套脚本启用或关闭。屏幕边缘指扣除菜单栏与 Dock 的可用区域。"
+        alert.informativeText="拖动：自由摆放；靠近屏幕可用边缘 36 点以内松手，自动吸附并变换姿势。\n双击：跳一下。右键：动作、大小、会话与退出。\n\n悬停约半秒显示上下文用量和账号额度。自动发现默认 Codex 和 Cockpit Tools 多开实例；右键可按来源切换或锁定会话。任务进行时显示简要操作气泡，可单独关闭。自动跟随依据日志活动，不检测当前前台聊天页签。\n\n上下文取最近一轮输入与输出 token 总和，不是逐轮累计消耗。额度是日志快照，账号共享，并标明更新时间；到达重置时间后等待新快照。\n\n程序只在本机读取 Codex 会话元数据和用量事件，不联网、不读取登录凭据。随 Codex 启动联动由配套脚本启用或关闭。屏幕边缘指扣除菜单栏与 Dock 的可用区域。"
         alert.addButton(withTitle:"知道了");NSApp.activate(ignoringOtherApps:true);alert.runModal()
     }
     @objc func quit() { NSApp.terminate(nil) }
@@ -300,27 +350,7 @@ final class PetController: NSObject, NSApplicationDelegate {
         if let window=window,let screen=dockedScreen { savePosition(window.frame.origin,in:screen,edge:petView.edge) }
     }
 
-    func runWindowSmokeTest() {
-        var results:[String:Any]=[:]
-        let s=NSScreen.main ?? NSScreen.screens[0]
-        for edge in DockEdge.allCases {
-            updatePosition(window.frame.origin,edge:edge,screen:s,animate:false)
-            results[edge.rawValue]=s.visibleFrame.contains(window.frame)
-        }
-        statsView.update(snapshot:UsageSnapshot(inputTokens:120_000,outputTokens:2000,capacity:475_000,usageDate:Date(),primary:LimitWindow(usedPercent:25,minutes:300,resetsAt:Date().addingTimeInterval(3600)),secondary:LimitWindow(usedPercent:40,minutes:10080,resetsAt:Date().addingTimeInterval(86400)),quotaDate:Date()),session:nil,message:nil,following:false)
-        tooltip.setFrameOrigin(Geometry.tooltip(pet:window.frame,size:tooltip.frame.size,area:s.visibleFrame));tooltip.orderFrontRegardless()
-        results["tooltipInsideScreen"]=s.visibleFrame.contains(tooltip.frame)
-        results["windowTransparent"]=(!window.isOpaque && window.backgroundColor.alphaComponent==0)
-        results["noFocusStealing"]=(!window.canBecomeKey)
-        perform(.jump);actionUntil=Date().addingTimeInterval(-1);tick()
-        results["actionReturnsToIdle"]=(petView.mood == .idle)
-        let passed=results.values.allSatisfy { ($0 as? Bool)==true }
-        smokePassed=passed
-        results["passed"]=passed
-        if let d=try? JSONSerialization.data(withJSONObject:results,options:[.sortedKeys]),let text=String(data:d,encoding:.utf8) { print(text) }
-        timer?.invalidate();dataTimer?.invalidate()
-        NSApp.terminate(nil)
-    }
+
 }
 
 import QuartzCore

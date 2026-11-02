@@ -46,7 +46,7 @@ func runTests() throws {
     let nullLimits=Data("{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"rate_limits\":{\"primary\":null,\"secondary\":null}}}\n".utf8)
     try check(LogParser.consume(nullLimits,previous:s)?.primary==nil,"missing windows are unavailable, not 100 percent")
 
-    let temp=FileManager.default.temporaryDirectory.appendingPathComponent("pai-tests-\(UUID().uuidString)",isDirectory:true)
+    let temp=FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("pai-tests-\(UUID().uuidString)",isDirectory:true)
     defer { try? FileManager.default.removeItem(at:temp) }
     let folder=temp.appendingPathComponent("sessions/2026/10/28",isDirectory:true)
     try FileManager.default.createDirectory(at:folder,withIntermediateDirectories:true)
@@ -70,5 +70,28 @@ func runTests() throws {
     try check(reader.read(sessions[0]).0?.contextUsed==11,"truncated file resets byte offset and cache")
     let missing=SessionInfo(id:"missing",path:folder.appendingPathComponent("absent.jsonl"),folder:"",modified:Date())
     try check(reader.read(missing).0==nil && reader.read(missing).1 != nil,"missing file does not leak previous session usage")
-    print("PASS: \(count) checks — snap geometry, multiple displays, quota expiry, log parsing, partial writes, subagent filtering, missing files")
+    let multi=temp.appendingPathComponent("profiles")
+    let primary=multi.appendingPathComponent(".codex")
+    let cockpit=multi.appendingPathComponent(".cockpit_tools/instances/codex/fixture-instance")
+    for root in [primary,cockpit] { try FileManager.default.createDirectory(at:root.appendingPathComponent("sessions"),withIntermediateDirectories:true) }
+    let primaryFile=primary.appendingPathComponent("sessions/rollout-shared.jsonl")
+    let cockpitFile=cockpit.appendingPathComponent("sessions/rollout-shared.jsonl")
+    try (meta("shared")+(try event(input:200,output:3))).write(to:primaryFile)
+    try (meta("shared")+(try event(input:700,output:9))).write(to:cockpitFile)
+    let multiReader=SessionReader(home:primary)
+    let multiSessions=multiReader.sessions(preferredID:nil)
+    try check(multiSessions.count==2,"Cockpit session roots discovered alongside default Codex")
+    guard let cockpitSession=multiSessions.first(where:{$0.selectionKey==cockpitFile.resolvingSymlinksInPath().path}),
+          let defaultSession=multiSessions.first(where:{$0.selectionKey==primaryFile.resolvingSymlinksInPath().path}) else {
+        throw TestFailure.failed("Discovered instance logs must match fixture paths")
+    }
+    try check(multiReader.read(cockpitSession).0?.contextUsed==709,"Cockpit usage reads its own instance log")
+    try check(multiReader.read(defaultSession).0?.contextUsed==203,"same session ID across instances cannot mix usage")
+    try check(cockpitSession.sourceName.hasPrefix("Cockpit"),"Cockpit source is visible in session picker")
+    try check(cockpitSession.selectionKey != defaultSession.selectionKey,"duplicate session IDs have distinct selection identities")
+    let alias=multi.appendingPathComponent(".cockpit_tools/instances/codex/alias")
+    try FileManager.default.createSymbolicLink(at:alias,withDestinationURL:primary)
+    try check(multiReader.sessions(preferredID:nil).count==2,"symlink source aliases do not duplicate sessions")
+    print("PASS: \(count) checks — geometry, quota, logs and Cockpit instance isolation")
+    try runActivityTests()
 }

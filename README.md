@@ -15,7 +15,9 @@
 
 ## 使用
 
-1. [下载桌面版（Apple Silicon）](downloads/PaiXiaoXing-macOS-arm64-v1.1.0.zip?raw=true)，解压后打开 `派小星.app`。
+v1.1.1 修复了左右贴边探头时手臂上出现多余圆圈和短横线的问题。
+
+1. [下载桌面版 v1.1.1（Apple Silicon）](downloads/PaiXiaoXing-macOS-arm64-v1.1.1.zip?raw=true)，解压后打开 `派小星.app`。
 2. 拖动摆放，靠近边缘约 36 点以内松手即可吸附。
 3. 鼠标停留约半秒查看用量；右键或菜单栏星星可以设置、隐藏和退出。
 4. 使用 Cockpit 多开时，在右键 **会话数据** 中选择对应的 `Cockpit 实例`，或选择 **跟随最近活跃会话**。需要固定跟踪某个窗口的任务时，选择并锁定该实例下的会话。

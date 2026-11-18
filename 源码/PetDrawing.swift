@@ -47,29 +47,24 @@ final class PetArtwork {
             let edgeMood: PetMood = mood == .idle ? .think : mood
             let face=frames[edgeMood.rawValue][reduced ? 0 : tick % edgeMood.frames]
             face.draw(in:CGRect(x:-66,y:bob+bounce,width:192,height:208))
-            palm(CGRect(x:1,y:81+bob,width:24,height:21),vertical:true)
         case .top,.bottom:
             if edge == .top {
                 let flip=NSAffineTransform();flip.translateX(by:0,yBy:208);flip.scaleX(by:1,yBy:-1);flip.concat()
             }
             let face=frames[mood.rawValue][reduced ? 0 : tick % mood.frames]
             face.draw(in:CGRect(x:0,y:-94+bob+bounce,width:192,height:208))
-            palm(CGRect(x:47,y:1,width:30,height:21),vertical:false)
-            palm(CGRect(x:116,y:1,width:30,height:21),vertical:false)
+            palm(CGRect(x:47,y:1,width:30,height:21))
+            palm(CGRect(x:116,y:1,width:30,height:21))
         }
     }
 
-    private func palm(_ rect: CGRect, vertical: Bool) {
+    private func palm(_ rect: CGRect) {
         let p=NSBezierPath(roundedRect:rect,xRadius:rect.width*0.48,yRadius:rect.height*0.48)
         NSColor(calibratedRed:0.97,green:0.66,blue:0.72,alpha:1).setFill();p.fill()
         NSColor(calibratedWhite:0.08,alpha:1).setStroke();p.lineWidth=2.2;p.stroke()
         let detail=NSBezierPath()
-        if vertical {
-            detail.move(to:CGPoint(x:rect.midX,y:rect.midY-4));detail.line(to:CGPoint(x:rect.midX+7,y:rect.midY-4))
-        } else {
-            detail.move(to:CGPoint(x:rect.midX-4,y:rect.minY+4));detail.line(to:CGPoint(x:rect.midX-4,y:rect.minY+9))
-            detail.move(to:CGPoint(x:rect.midX+3,y:rect.minY+4));detail.line(to:CGPoint(x:rect.midX+3,y:rect.minY+9))
-        }
+        detail.move(to:CGPoint(x:rect.midX-4,y:rect.minY+4));detail.line(to:CGPoint(x:rect.midX-4,y:rect.minY+9))
+        detail.move(to:CGPoint(x:rect.midX+3,y:rect.minY+4));detail.line(to:CGPoint(x:rect.midX+3,y:rect.minY+9))
         detail.lineWidth=1.5;detail.lineCapStyle = .round;detail.stroke()
     }
 }
